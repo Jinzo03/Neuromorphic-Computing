@@ -7,7 +7,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from brian2 import start_scope, SpikeGeneratorGroup, NeuronGroup, Synapses, SpikeMonitor, StateMonitor, run, ms, second, prefs
 
-# ensure numpy codegen target for Brian2 (safer on many systems)
 prefs.codegen.target = 'numpy'
 
 # ---------- Synthetic event generator ----------
@@ -35,8 +34,7 @@ def generate_moving_bar_events(width=32, height=32,
                 tt = float(t)
                 if temporal_jitter > 0.0:
                     tt += np.random.normal(scale=temporal_jitter)
-                    if tt < 0:
-                        tt = 0.0
+                    tt = max(0.0, tt)
                 events.append((int(x), int(y), float(tt), int(polarity)))
     return events
 
@@ -44,27 +42,32 @@ def events_to_spikegenerator_args(events, width, height):
     Npix = width * height
     indices = []
     times = []
-    for (x,y,t,pol) in events:
+    for (x, y, t, pol) in events:
         i = y * width + x + pol * Npix
         indices.append(int(i))
         times.append(float(t))
     indices = np.array(indices, dtype=np.int64)
-    times = np.array(times) * second
+    times = np.array(times)
+    # FIX 2: sort by time — required by SpikeGeneratorGroup, broken by temporal jitter
+    sort_order = np.argsort(times, kind='stable')
+    indices = indices[sort_order]
+    times = times[sort_order] * second
     return indices, times
 
 # ---------- Run a single trial in Brian2 ----------
 def run_snn_trial(indices, times, width, height, sim_duration_s,
                   N_rec=128, conn_p=0.03, input_weight=0.03, recur_weight=0.02):
     start_scope()
-    N_in = width * height * 2  # two polarity channels
+    N_in = width * height * 2
     G_in = SpikeGeneratorGroup(N_in, indices=indices, times=times)
-    # LIF
     eqs = "dv/dt = (-v) / (10*ms) : 1"
     G = NeuronGroup(N_rec, eqs, threshold='v>1', reset='v=0', method='exact')
-    S = Synapses(G_in, G, on_pre='v += w_pre')
+    # FIX 1: declare 'w_pre : 1' in the synapse model string before using it in on_pre
+    S = Synapses(G_in, G, model='w_pre : 1', on_pre='v += w_pre')
     S.connect(p=conn_p)
     S.w_pre = input_weight
-    R = Synapses(G, G, on_pre='v += w_rec')
+    # FIX 1: same fix for recurrent synapses
+    R = Synapses(G, G, model='w_rec : 1', on_pre='v += w_rec')
     R.connect(p=0.02)
     R.w_rec = recur_weight
     sm_in = SpikeMonitor(G_in)
@@ -89,7 +92,7 @@ def build_dataset(n_trials_per_class=40, width=32, height=32,
     X_counts = []
     labels = []
     trial_spike_data = []
-    for cls_idx, direction in enumerate(['right','left']):
+    for cls_idx, direction in enumerate(['right', 'left']):
         for tnum in range(n_trials_per_class):
             speed = base_speed + np.random.normal(scale=8.0)
             events = generate_moving_bar_events(width=width, height=height, duration_s=sim_duration_s,
@@ -101,7 +104,7 @@ def build_dataset(n_trials_per_class=40, width=32, height=32,
             X_counts.append(sim['counts'])
             labels.append(cls_idx)
             if tnum == 0:
-                trial_spike_data.append({'direction':direction, 'sim':sim, 'width':width, 'height':height})
+                trial_spike_data.append({'direction': direction, 'sim': sim, 'width': width, 'height': height})
     X = np.vstack(X_counts)
     y = np.array(labels, dtype=int)
     return X, y, trial_spike_data
@@ -109,13 +112,13 @@ def build_dataset(n_trials_per_class=40, width=32, height=32,
 # ---------- Simple closed-form ridge ----------
 def train_ridge(X_train, y_train, alpha=1.0):
     N, D = X_train.shape
-    Xb = np.hstack([X_train, np.ones((N,1))])
-    t = y_train.astype(float).reshape(-1,1)
-    I = np.eye(D+1)
-    I[-1,-1] = 0.0
+    Xb = np.hstack([X_train, np.ones((N, 1))])
+    t = y_train.astype(float).reshape(-1, 1)
+    I = np.eye(D + 1)
+    I[-1, -1] = 0.0
     W = np.linalg.inv(Xb.T.dot(Xb) + alpha * I).dot(Xb.T).dot(t)
-    w = W[:-1,0]
-    b = float(W[-1,0])
+    w = W[:-1, 0]
+    b = float(W[-1, 0])
     return w, b
 
 def predict_counts(X, w, b):
@@ -126,7 +129,7 @@ def predict_counts(X, w, b):
 # ---------- Latency computation ----------
 def compute_latency_for_trial(sim_data, w, b, sim_duration_s, min_hold_s=0.03):
     dt = 0.001
-    times = np.arange(0, sim_duration_s+1e-9, dt)
+    times = np.arange(0, sim_duration_s + 1e-9, dt)
     N_rec = len(w)
     cum_counts = np.zeros((len(times), N_rec))
     out_t = sim_data['out_t']
@@ -143,8 +146,8 @@ def compute_latency_for_trial(sim_data, w, b, sim_duration_s, min_hold_s=0.03):
     final_pred = preds_t[-1]
     hold_bins = int(np.ceil(min_hold_s / dt))
     earliest_t = None
-    for i in range(len(times)-hold_bins):
-        if preds_t[i] == final_pred and np.all(preds_t[i:i+hold_bins] == final_pred):
+    for i in range(len(times) - hold_bins):
+        if preds_t[i] == final_pred and np.all(preds_t[i:i + hold_bins] == final_pred):
             earliest_t = times[i]
             break
     if earliest_t is None:
@@ -165,7 +168,6 @@ def main():
     test_acc = (preds_test == y_test).mean()
     print(f"Train acc: {train_acc*100:.2f}%  Test acc (counts readout): {test_acc*100:.2f}%")
 
-    # latency: re-simulate test trials to compute time-to-decision
     print("Computing latency by re-simulating test trials...")
     latencies = []
     final_preds = []
@@ -186,30 +188,29 @@ def main():
     print(f"Re-simulated test acc (final): {test_acc_resim*100:.2f}%")
     print(f"Mean latency: {latencies.mean()*1000.0:.1f} ms  Median: {np.median(latencies)*1000.0:.1f} ms")
 
-    # ---------- Plots ----------
     sample = trial_spike_data[0]['sim']
-    plt.figure(figsize=(10,4))
-    plt.subplot(1,2,1)
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
     plt.plot(sample['in_t']*1000.0, sample['in_i'], '.')
     plt.xlabel('Time (ms)'); plt.ylabel('Input neuron index'); plt.title('Input spikes (sample)')
-    plt.subplot(1,2,2)
+    plt.subplot(1, 2, 2)
     plt.plot(sample['out_t']*1000.0, sample['out_i'], '.')
     plt.xlabel('Time (ms)'); plt.ylabel('Hidden neuron index'); plt.title('Hidden spikes (sample)')
     plt.tight_layout()
 
     from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
     cm = confusion_matrix(y_test, preds_test)
-    plt.figure(figsize=(4,3))
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['right','left'])
+    plt.figure(figsize=(4, 3))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['right', 'left'])
     disp.plot(values_format='d', cmap=None, colorbar=False)
     plt.title('Confusion matrix (test set)')
 
-    plt.figure(figsize=(5,3))
+    plt.figure(figsize=(5, 3))
     plt.hist(latencies*1000.0, bins=15)
     plt.xlabel('Latency (ms)'); plt.ylabel('Count'); plt.title('Latency distribution')
 
     avg_counts = X_train.mean(axis=0)
-    plt.figure(figsize=(6,3))
+    plt.figure(figsize=(6, 3))
     plt.imshow(avg_counts.reshape(1, -1), aspect='auto', origin='lower')
     plt.xlabel('Hidden neuron index'); plt.yticks([]); plt.title('Average spike count per hidden neuron (train)')
 
