@@ -62,14 +62,12 @@ def run_snn_trial(indices, times, width, height, sim_duration_s,
     G_in = SpikeGeneratorGroup(N_in, indices=indices, times=times)
     eqs = "dv/dt = (-v) / (10*ms) : 1"
     G = NeuronGroup(N_rec, eqs, threshold='v>1', reset='v=0', method='exact')
-    # FIX 1: declare 'w_pre : 1' in the synapse model string before using it in on_pre
-    S = Synapses(G_in, G, model='w_pre : 1', on_pre='v += w_pre')
+    S = Synapses(G_in, G, model='w : 1', on_pre='v += w')  
     S.connect(p=conn_p)
-    S.w_pre = input_weight
-    # FIX 1: same fix for recurrent synapses
-    R = Synapses(G, G, model='w_rec : 1', on_pre='v += w_rec')
+    S.w = input_weight
+    R = Synapses(G, G, model='w : 1', on_pre='v += w')     
     R.connect(p=0.02)
-    R.w_rec = recur_weight
+    R.w = recur_weight
     sm_in = SpikeMonitor(G_in)
     sm = SpikeMonitor(G)
     vm = StateMonitor(G, 'v', record=[0])
