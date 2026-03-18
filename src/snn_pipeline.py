@@ -38,7 +38,10 @@ def generate_moving_bar_events(width=32, height=32,
                 events.append((int(x), int(y), float(tt), int(polarity)))
     return events
 
-def events_to_spikegenerator_args(events, width, height):
+def events_to_spikegenerator_args(events, width, height, min_dt_s=0.0002):
+    """
+    min_dt_s: minimum allowed gap between spikes of the same neuron (default 0.2ms > Brian2's 0.1ms dt)
+    """
     Npix = width * height
     indices = []
     times = []
@@ -48,10 +51,28 @@ def events_to_spikegenerator_args(events, width, height):
         times.append(float(t))
     indices = np.array(indices, dtype=np.int64)
     times = np.array(times)
-    # FIX 2: sort by time — required by SpikeGeneratorGroup, broken by temporal jitter
+
+    # sort by time first
     sort_order = np.argsort(times, kind='stable')
     indices = indices[sort_order]
-    times = times[sort_order] * second
+    times = times[sort_order]
+
+    # FIX: for each neuron, enforce minimum spacing between consecutive spikes
+    neuron_last_time = {}
+    for k in range(len(indices)):
+        n = indices[k]
+        t = times[k]
+        if n in neuron_last_time:
+            min_allowed = neuron_last_time[n] + min_dt_s
+            if t < min_allowed:
+                t = min_allowed       # nudge forward just past the previous spike
+        neuron_last_time[n] = t
+        times[k] = t
+
+    # re-sort after nudging (nudges can slightly reorder times)
+    sort_order2 = np.argsort(times, kind='stable')
+    indices = indices[sort_order2]
+    times = times[sort_order2] * second
     return indices, times
 
 # ---------- Run a single trial in Brian2 ----------
@@ -59,13 +80,17 @@ def run_snn_trial(indices, times, width, height, sim_duration_s,
                   N_rec=128, conn_p=0.03, input_weight=0.03, recur_weight=0.02):
     start_scope()
     N_in = width * height * 2
+    # FIX: clip spike times to [0, sim_duration_s) to avoid out-of-bounds spikes
+    valid = (times / second) < sim_duration_s
+    indices = indices[valid]
+    times = times[valid]
     G_in = SpikeGeneratorGroup(N_in, indices=indices, times=times)
     eqs = "dv/dt = (-v) / (10*ms) : 1"
     G = NeuronGroup(N_rec, eqs, threshold='v>1', reset='v=0', method='exact')
-    S = Synapses(G_in, G, model='w : 1', on_pre='v += w')  
+    S = Synapses(G_in, G, model='w : 1', on_pre='v += w')
     S.connect(p=conn_p)
     S.w = input_weight
-    R = Synapses(G, G, model='w : 1', on_pre='v += w')     
+    R = Synapses(G, G, model='w : 1', on_pre='v += w')
     R.connect(p=0.02)
     R.w = recur_weight
     sm_in = SpikeMonitor(G_in)
@@ -81,7 +106,7 @@ def run_snn_trial(indices, times, width, height, sim_duration_s,
         'in_t': in_spikes_t, 'in_i': in_spikes_i,
         'out_t': out_spikes_t, 'out_i': out_spikes_i,
         'counts': counts.astype(float),
-        'vm_t': np.array(vm.t/second), 'vm_v': vm.v[0].copy()
+        'vm_t': np.array(vm.t / second), 'vm_v': vm.v[0].copy()
     }
 
 # ---------- Build dataset ----------
