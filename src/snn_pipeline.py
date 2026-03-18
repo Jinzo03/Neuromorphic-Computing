@@ -14,6 +14,7 @@ Notes:
   may not have brian2 installed, so run locally in a virtualenv as needed.
 - If you see many zero-spike trials, increase input_weight, conn_p, or tau (in eqs).
 """
+from matplotlib import cm
 import numpy as np
 import matplotlib.pyplot as plt
 from brian2 import (
@@ -209,16 +210,18 @@ def extract_binned_hidden_counts(sim_out, N_rec, sim_duration_s, n_bins=8):
 # ---------- Bin-based latency computation (using classifier) ----------
 def compute_latency_binned(sim_data, clf, true_label, sim_duration_s, n_bins=8, min_hold_s=0.03):
     """
-    Compute earliest time (in seconds) when the running binned readout equals true_label
-    and holds for min_hold_s. Running readout is computed at bin granularity:
-      - at bin k we use counts for bins 0..k and zeros for k+1..n_bins-1 (partial observation).
-    Returns earliest_time, array_of_logits_per_bin, bins (bin edges).
+    Compute earliest time when the running binned readout equals true_label
+    and holds for min_hold_s. Uses classifier.decision_function (scalar) per bin.
+    Returns earliest_time (seconds), logits_per_bin (length n_bins), bins (edges).
     """
-    bins = np.linspace(0.0, sim_duration_s, n_bins + 1)  # length n_bins+1
+    bins = np.linspace(0.0, sim_duration_s, n_bins + 1)
     bin_duration = bins[1] - bins[0]
+    # infer N_rec from classifier shape
+    # For binary logistic regression, clf.coef_.shape == (1, D) where D = N_rec * n_bins
+    D = clf.coef_.shape[1]
+    N_rec = int(D // n_bins)
+
     # compute per-neuron per-bin counts
-    N_rec = int(clf.coef_.shape[1] // n_bins)
-    # build a per-neuron-per-bin matrix
     per_bin_counts = np.zeros((N_rec, n_bins), dtype=float)
     out_t = sim_data["out_t"]
     out_i = sim_data["out_i"]
@@ -232,29 +235,25 @@ def compute_latency_binned(sim_data, clf, true_label, sim_duration_s, n_bins=8, 
     logits_per_bin = np.zeros(n_bins, dtype=float)
     preds_per_bin = np.zeros(n_bins, dtype=int)
 
-    # For each bin k, construct a feature vector using counts for bins <= k and zeros elsewhere
     for k in range(n_bins):
         feat = np.zeros((N_rec, n_bins), dtype=float)
         if k >= 0:
             feat[:, : k + 1] = per_bin_counts[:, : k + 1]
         feat_flat = feat.ravel().reshape(1, -1)
-        # Ensure classifier shape matches
-        logits = clf.decision_function(feat_flat)  # decision function is linear for LR
-        # decision_function returns shape (n_samples,) for binary
-        logits_per_bin[k] = float(logits)
-        preds_per_bin[k] = int((logits >= 0).astype(int))
-    # Determine earliest bin index where pred == true_label and holds for min_hold_s
+        # decision_function returns an array shape (n_samples,) for binary
+        logits_arr = clf.decision_function(feat_flat)
+        logits_val = float(logits_arr[0])   # <- extract scalar safely
+        logits_per_bin[k] = logits_val
+        preds_per_bin[k] = int(logits_val >= 0.0)  # decision boundary at 0 for decision_function
+
+    # require hold for min_hold_s
     hold_bins = max(1, int(np.ceil(min_hold_s / bin_duration)))
     earliest_bin = None
     for k in range(0, n_bins - hold_bins + 1):
         if preds_per_bin[k] == true_label and np.all(preds_per_bin[k : k + hold_bins] == true_label):
             earliest_bin = k
             break
-    if earliest_bin is None:
-        # not stable within trial
-        earliest_time = sim_duration_s
-    else:
-        earliest_time = bins[earliest_bin]  # start time of that bin
+    earliest_time = sim_duration_s if earliest_bin is None else float(bins[earliest_bin])
     return earliest_time, logits_per_bin, bins
 
 
@@ -411,10 +410,24 @@ def main():
 
     # confusion matrix using classifier on X_test
     cm = confusion_matrix(y_test, preds_test)
-    plt.figure(figsize=(4, 3))
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["right", "left"])
-    disp.plot(values_format="d", cmap=None, colorbar=False)
-    plt.title("Confusion matrix (test set)")
+    plt.figure(figsize=(4,3))
+    plt.imshow(cm, interpolation='nearest', cmap='Blues')
+    plt.title('Confusion matrix (test set)')
+    plt.colorbar()
+    classes = ['right', 'left']
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes)
+    plt.yticks(tick_marks, classes)
+    thresh = cm.max() / 2.0 if cm.max() > 0 else 1.0
+    # annotate counts
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, format(int(cm[i, j]), 'd'),
+                    horizontalalignment='center',
+                    color='white' if cm[i, j] > thresh else 'black')
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.tight_layout()
 
     # latency histogram
     plt.figure(figsize=(5, 3))
