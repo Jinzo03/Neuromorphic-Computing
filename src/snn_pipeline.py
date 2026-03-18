@@ -1,20 +1,20 @@
 """
-step3_snn_pipeline_updated.py
+step3_snn_pipeline_tuned.py
 
-Complete pipeline for synthetic moving-bar DVS -> Brian2 SNN -> time-binned readout -> evaluation + latency.
+Tuned pipeline for synthetic moving-bar DVS -> Brian2 SNN -> time-binned readout -> evaluation + latency.
+Includes diagnostics for failed re-simulated trials.
 
 Run:
-    python step3_snn_pipeline_updated.py
+    python step3_snn_pipeline_tuned.py
 
 Dependencies:
     numpy, matplotlib, scikit-learn, brian2
 
 Notes:
-- This script is designed for local execution. The notebook environment used by ChatGPT
-  may not have brian2 installed, so run locally in a virtualenv as needed.
-- If you see many zero-spike trials, increase input_weight, conn_p, or tau (in eqs).
+- This script may take some time (many small Brian2 sims). For quick debugging lower
+  n_trials_per_class in main() to 10 or 20.
+- If you see many zero-spike trials, try increasing input_weight or conn_p further.
 """
-from matplotlib import cm
 import numpy as np
 import matplotlib.pyplot as plt
 from brian2 import (
@@ -29,14 +29,17 @@ from brian2 import (
     second,
     prefs,
 )
-
-# Ensure Brian2 uses numpy codegen target (more robust on many systems)
-prefs.codegen.target = "numpy"
-
-# sklearn imports
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import confusion_matrix
+import warnings
+
+# Use numpy codegen target for Brian2 (robust)
+prefs.codegen.target = "numpy"
+
+# silence harmless sklearn convergence warnings in long runs (optional)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+
 
 # ---------- Synthetic event generator ----------
 def generate_moving_bar_events(
@@ -50,10 +53,6 @@ def generate_moving_bar_events(
     polarity=0,
     temporal_jitter=0.0,
 ):
-    """
-    Generate deterministic synthetic events for a vertical bright bar moving horizontally.
-    Returns list of (x, y, t_seconds, polarity).
-    """
     dt = 1.0 / fps
     times = np.arange(0, duration_s, dt)
     events = []
@@ -83,9 +82,8 @@ def generate_moving_bar_events(
 
 def events_to_spikegenerator_args(events, width, height, min_dt_s=0.0002):
     """
-    Convert events -> SpikeGeneratorGroup args (indices, times).
-    - Enforce minimal inter-spike gap for each neuron (to satisfy Brian2 resolution).
-    - Return indices (np.array int) and times (brian2 seconds array).
+    Convert events -> (indices, times) for Brian2 SpikeGeneratorGroup.
+    Enforce minimal inter-spike gap per neuron to satisfy Brian2 resolution.
     """
     Npix = width * height
     indices = []
@@ -129,18 +127,18 @@ def run_snn_trial(
     height,
     sim_duration_s,
     N_rec=128,
-    conn_p=0.05,
-    input_weight=0.06,
+    conn_p=0.06,
+    input_weight=0.08,
     recur_weight=0.03,
-    tau_ms=10.0,
+    tau_ms=20.0,
 ):
     """
-    Run a single Brian2 simulation trial and return spike arrays and counts.
-    Prints a debug line showing input/output spike counts (comment out if too verbose).
+    Run one Brian2 simulation and return spike arrays + counts.
+    Debug print included to detect sparse trials.
     """
     start_scope()
-    N_in = width * height * 2  # two polarity channels
-    # clip spike times to avoid out-of-range spikes
+    N_in = width * height * 2
+    # clip spike times to [0, sim_duration_s)
     valid_mask = (times / second) < sim_duration_s
     indices = indices[valid_mask]
     times = times[valid_mask]
@@ -149,19 +147,17 @@ def run_snn_trial(
     eqs = f"dv/dt = (-v) / ({tau_ms}*ms) : 1"
     G = NeuronGroup(N_rec, eqs, threshold="v>1", reset="v=0", method="exact")
 
-    # Input -> hidden
     S = Synapses(G_in, G, model="w : 1", on_pre="v += w")
     S.connect(p=conn_p)
     S.w = input_weight
 
-    # Recurrent
     R = Synapses(G, G, model="w : 1", on_pre="v += w")
     R.connect(p=0.02)
     R.w = recur_weight
 
     sm_in = SpikeMonitor(G_in)
     sm = SpikeMonitor(G)
-    vm = StateMonitor(G, "v", record=[0])  # record first neuron voltage for demo
+    vm = StateMonitor(G, "v", record=[0])
     run(sim_duration_s * second)
 
     in_spikes_t = np.array(sm_in.t / second)
@@ -170,7 +166,7 @@ def run_snn_trial(
     out_spikes_i = np.array(sm.i)
     counts = np.bincount(out_spikes_i, minlength=N_rec)
 
-    # debug print to detect sparse trials
+    # debug
     total_in = len(in_spikes_t)
     total_out = len(out_spikes_t)
     print(f"[debug] in_spikes={total_in} out_spikes={total_out} sum_hidden_counts={counts.sum():.0f}")
@@ -187,18 +183,13 @@ def run_snn_trial(
 
 
 # ---------- Time-binned feature extractor ----------
-def extract_binned_hidden_counts(sim_out, N_rec, sim_duration_s, n_bins=8):
-    """
-    Convert sim_out (containing 'out_t' and 'out_i') into flattened (N_rec * n_bins,) features.
-    Each neuron's spikes are binned into n_bins uniform time bins across sim_duration_s.
-    """
+def extract_binned_hidden_counts(sim_out, N_rec, sim_duration_s, n_bins=12):
     bins = np.linspace(0.0, sim_duration_s, n_bins + 1)
     features = np.zeros((N_rec, n_bins), dtype=float)
     out_t = sim_out["out_t"]
     out_i = sim_out["out_i"]
     if out_t.size == 0:
         return features.ravel()
-    # find bin index for each spike
     bin_inds = np.searchsorted(bins, out_t, side="right") - 1
     bin_inds = np.clip(bin_inds, 0, n_bins - 1)
     for neuron, bidx in zip(out_i, bin_inds):
@@ -207,21 +198,13 @@ def extract_binned_hidden_counts(sim_out, N_rec, sim_duration_s, n_bins=8):
     return features.ravel()
 
 
-# ---------- Bin-based latency computation (using classifier) ----------
-def compute_latency_binned(sim_data, clf, true_label, sim_duration_s, n_bins=8, min_hold_s=0.03):
-    """
-    Compute earliest time when the running binned readout equals true_label
-    and holds for min_hold_s. Uses classifier.decision_function (scalar) per bin.
-    Returns earliest_time (seconds), logits_per_bin (length n_bins), bins (edges).
-    """
+# ---------- Bin-based latency computation (safe scalar handling) ----------
+def compute_latency_binned(sim_data, clf, true_label, sim_duration_s, n_bins=12, min_hold_s=0.03):
     bins = np.linspace(0.0, sim_duration_s, n_bins + 1)
     bin_duration = bins[1] - bins[0]
-    # infer N_rec from classifier shape
-    # For binary logistic regression, clf.coef_.shape == (1, D) where D = N_rec * n_bins
     D = clf.coef_.shape[1]
     N_rec = int(D // n_bins)
 
-    # compute per-neuron per-bin counts
     per_bin_counts = np.zeros((N_rec, n_bins), dtype=float)
     out_t = sim_data["out_t"]
     out_i = sim_data["out_i"]
@@ -237,16 +220,13 @@ def compute_latency_binned(sim_data, clf, true_label, sim_duration_s, n_bins=8, 
 
     for k in range(n_bins):
         feat = np.zeros((N_rec, n_bins), dtype=float)
-        if k >= 0:
-            feat[:, : k + 1] = per_bin_counts[:, : k + 1]
+        feat[:, : k + 1] = per_bin_counts[:, : k + 1]
         feat_flat = feat.ravel().reshape(1, -1)
-        # decision_function returns an array shape (n_samples,) for binary
         logits_arr = clf.decision_function(feat_flat)
-        logits_val = float(logits_arr[0])   # <- extract scalar safely
+        logits_val = float(logits_arr[0])  # extract scalar safely
         logits_per_bin[k] = logits_val
-        preds_per_bin[k] = int(logits_val >= 0.0)  # decision boundary at 0 for decision_function
+        preds_per_bin[k] = int(logits_val >= 0.0)
 
-    # require hold for min_hold_s
     hold_bins = max(1, int(np.ceil(min_hold_s / bin_duration)))
     earliest_bin = None
     for k in range(0, n_bins - hold_bins + 1):
@@ -257,9 +237,9 @@ def compute_latency_binned(sim_data, clf, true_label, sim_duration_s, n_bins=8, 
     return earliest_time, logits_per_bin, bins
 
 
-# ---------- Build dataset ----------
+# ---------- Build dataset (tuned) ----------
 def build_dataset(
-    n_trials_per_class=40,
+    n_trials_per_class=120,
     width=32,
     height=32,
     sim_duration_s=0.4,
@@ -267,20 +247,14 @@ def build_dataset(
     bar_width=4,
     base_speed=100.0,
     N_rec=128,
-    n_bins=8,
+    n_bins=12,
 ):
-    """
-    Run many trials (Brian2 sims) and return:
-      - X: (n_trials, N_rec * n_bins) features (binned hidden counts)
-      - y: labels (0=right, 1=left)
-      - trial_spike_data: list of first trial per class (for plotting/debug)
-    """
     X_features = []
     labels = []
     trial_spike_data = []
     for cls_idx, direction in enumerate(["right", "left"]):
         for tnum in range(n_trials_per_class):
-            speed = base_speed + np.random.normal(scale=8.0)
+            speed = base_speed + np.random.normal(scale=12.0)
             events = generate_moving_bar_events(
                 width=width,
                 height=height,
@@ -290,7 +264,7 @@ def build_dataset(
                 speed_px_per_s=speed,
                 direction=direction,
                 polarity=0,
-                temporal_jitter=0.002,
+                temporal_jitter=0.004,
             )
             indices, times = events_to_spikegenerator_args(events, width, height)
             sim = run_snn_trial(
@@ -300,10 +274,10 @@ def build_dataset(
                 height,
                 sim_duration_s,
                 N_rec=N_rec,
-                conn_p=0.05,
-                input_weight=0.06,
+                conn_p=0.06,
+                input_weight=0.08,
                 recur_weight=0.03,
-                tau_ms=15.0,
+                tau_ms=20.0,
             )
             features = extract_binned_hidden_counts(sim, N_rec=N_rec, sim_duration_s=sim_duration_s, n_bins=n_bins)
             X_features.append(features)
@@ -316,26 +290,46 @@ def build_dataset(
 
 
 # ---------- Train logistic readout ----------
-def train_logistic(X_train, y_train, C=1.0, max_iter=1000):
+def train_logistic(X_train, y_train, C=0.1, max_iter=2000):
     clf = LogisticRegression(C=C, solver="lbfgs", max_iter=max_iter)
     clf.fit(X_train, y_train)
     return clf
 
 
+# ---------- Diagnostics plotting for failed resims ----------
+def plot_trial_debug(sim, clf, true_label, n_bins=12, sim_duration_s=0.4):
+    latency_s, logits_per_bin, bins = compute_latency_binned(sim, clf, true_label=true_label, sim_duration_s=sim_duration_s, n_bins=n_bins)
+    plt.figure(figsize=(9,4))
+    plt.subplot(1,3,1)
+    if sim["in_t"].size > 0:
+        plt.plot(sim["in_t"] * 1000.0, sim["in_i"], ".")
+    plt.title("input spikes"); plt.xlabel("ms")
+    plt.subplot(1,3,2)
+    if sim["out_t"].size > 0:
+        plt.plot(sim["out_t"] * 1000.0, sim["out_i"], ".")
+    plt.title("hidden spikes"); plt.xlabel("ms")
+    plt.subplot(1,3,3)
+    plt.plot((bins[:-1]) * 1000.0, logits_per_bin, "-o")
+    plt.axhline(0, color="k", linestyle="--")
+    plt.title(f"logits per bin (latency={latency_s*1000.0:.0f} ms)")
+    plt.tight_layout()
+    plt.show()
+
+
 # ---------- Main pipeline ----------
 def main():
-    print("Building dataset and running SNN trials (this will take some time)...")
+    print("Building dataset and running SNN trials (this will take a while)...")
     N_rec = 128
-    n_bins = 8
+    n_bins = 12
     X, y, trial_spike_data = build_dataset(
-        n_trials_per_class=40, width=32, height=32, sim_duration_s=0.4, N_rec=N_rec, n_bins=n_bins
+        n_trials_per_class=120, width=32, height=32, sim_duration_s=0.4, N_rec=N_rec, n_bins=n_bins
     )
     print("Dataset built:", X.shape)
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
 
     print("Training logistic regression readout (time-binned features)...")
-    clf = train_logistic(X_train, y_train, C=0.5, max_iter=1000)
+    clf = train_logistic(X_train, y_train, C=0.1, max_iter=2000)
     preds_train = clf.predict(X_train)
     preds_test = clf.predict(X_test)
     train_acc = (preds_train == y_train).mean()
@@ -346,8 +340,8 @@ def main():
     print("Computing latency by re-simulating test trials (bin-based measure)...")
     latencies = []
     final_preds = []
+    sims_for_test = []
     for i in range(len(X_test)):
-        # resimulate a fresh trial with similar variability
         direction = "right" if y_test[i] == 0 else "left"
         events = generate_moving_bar_events(
             width=32,
@@ -355,10 +349,10 @@ def main():
             duration_s=0.4,
             fps=200,
             bar_width=4,
-            speed_px_per_s=100.0 + np.random.normal(scale=8.0),
+            speed_px_per_s=100.0 + np.random.normal(scale=12.0),
             direction=direction,
             polarity=0,
-            temporal_jitter=0.002,
+            temporal_jitter=0.004,
         )
         indices, times = events_to_spikegenerator_args(events, 32, 32)
         sim = run_snn_trial(
@@ -368,15 +362,14 @@ def main():
             32,
             0.4,
             N_rec=N_rec,
-            conn_p=0.05,
-            input_weight=0.06,
+            conn_p=0.06,
+            input_weight=0.08,
             recur_weight=0.03,
-            tau_ms=15.0,
+            tau_ms=20.0,
         )
-        # compute latency in seconds (bin-based)
+        sims_for_test.append(sim)
         latency_s, logits_per_bin, bins = compute_latency_binned(sim, clf, true_label=y_test[i], sim_duration_s=0.4, n_bins=n_bins, min_hold_s=0.03)
         latencies.append(latency_s)
-        # final pred based on full observation (all bins)
         feat_full = extract_binned_hidden_counts(sim, N_rec=N_rec, sim_duration_s=0.4, n_bins=n_bins).reshape(1, -1)
         final_pred = int(clf.predict(feat_full)[0])
         final_preds.append(final_pred)
@@ -385,9 +378,7 @@ def main():
     final_preds = np.array(final_preds)
     test_acc_resim = (final_preds == y_test).mean()
     print(f"Re-simulated Test acc (final predicted using full trial): {test_acc_resim*100:.2f}%")
-    print(
-        f"Mean latency: {latencies.mean()*1000.0:.1f} ms  Median: {np.median(latencies)*1000.0:.1f} ms"
-    )
+    print(f"Mean latency: {latencies.mean()*1000.0:.1f} ms  Median: {np.median(latencies)*1000.0:.1f} ms")
 
     # ---- Visualizations ----
     # sample rasters (first stored trial)
@@ -408,37 +399,50 @@ def main():
     plt.title("Hidden spikes (sample trial)")
     plt.tight_layout()
 
-    # confusion matrix using classifier on X_test
+    # explicit confusion matrix plot for stored-test
     cm = confusion_matrix(y_test, preds_test)
-    plt.figure(figsize=(4,3))
-    plt.imshow(cm, interpolation='nearest', cmap='Blues')
-    plt.title('Confusion matrix (test set)')
+    plt.figure(figsize=(4, 3))
+    plt.imshow(cm, interpolation="nearest", cmap="Blues")
+    plt.title("Confusion matrix (stored-test)")
     plt.colorbar()
-    classes = ['right', 'left']
+    classes = ["right", "left"]
     tick_marks = np.arange(len(classes))
     plt.xticks(tick_marks, classes)
     plt.yticks(tick_marks, classes)
     thresh = cm.max() / 2.0 if cm.max() > 0 else 1.0
-    # annotate counts
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
-            plt.text(j, i, format(int(cm[i, j]), 'd'),
-                    horizontalalignment='center',
-                    color='white' if cm[i, j] > thresh else 'black')
-    plt.ylabel('True label')
-    plt.xlabel('Predicted label')
+            plt.text(j, i, format(int(cm[i, j]), "d"), horizontalalignment="center",
+                     color="white" if cm[i, j] > thresh else "black")
+    plt.ylabel("True label")
+    plt.xlabel("Predicted label")
+    plt.tight_layout()
+
+    # confusion matrix for resimulated preds
+    cm_resim = confusion_matrix(y_test, final_preds)
+    plt.figure(figsize=(4, 3))
+    plt.imshow(cm_resim, interpolation="nearest", cmap="Oranges")
+    plt.title("Confusion matrix (resimulated-test)")
+    plt.colorbar()
+    thresh = cm_resim.max() / 2.0 if cm_resim.max() > 0 else 1.0
+    for i in range(cm_resim.shape[0]):
+        for j in range(cm_resim.shape[1]):
+            plt.text(j, i, format(int(cm_resim[i, j]), "d"), horizontalalignment="center",
+                     color="white" if cm_resim[i, j] > thresh else "black")
+    plt.ylabel("True label")
+    plt.xlabel("Predicted label")
     plt.tight_layout()
 
     # latency histogram
     plt.figure(figsize=(5, 3))
-    plt.hist(latencies * 1000.0, bins=15)
+    plt.hist(latencies * 1000.0, bins=20)
     plt.xlabel("Latency (ms)")
     plt.ylabel("Count")
     plt.title("Latency distribution (re-simulated test set)")
 
     # average spike-count heatmap (train set aggregated per neuron across bins)
     avg_counts = X_train.mean(axis=0)  # shape (N_rec * n_bins,)
-    plt.figure(figsize=(8, 3))
+    plt.figure(figsize=(8, 4))
     plt.imshow(avg_counts.reshape(N_rec, n_bins), aspect="auto", origin="lower")
     plt.xlabel("Time bin index")
     plt.ylabel("Hidden neuron index")
@@ -454,6 +458,20 @@ def main():
     print(f"  Re-simulated test acc (final pred): {test_acc_resim*100:.2f}%")
     print(f"  Mean latency (ms): {latencies.mean()*1000.0:.1f}")
     print(f"  Median latency (ms): {np.median(latencies)*1000.0:.1f}")
+
+    # ----- Diagnostics: inspect failing resim trials -----
+    failed_idx = np.where(final_preds != y_test)[0]
+    print("\nDIAGNOSTICS:")
+    print("Resim confusion matrix:\n", cm_resim)
+    print("Resim preds distribution:", np.bincount(final_preds))
+    print("True distribution:", np.bincount(y_test))
+    print(f"Number of failed resim trials: {len(failed_idx)} / {len(y_test)}")
+    if len(failed_idx) > 0:
+        print("Failed indices (first 10):", failed_idx[:10])
+        # show up to 4 failing trial visualizations
+        for idx in failed_idx[:4]:
+            print(f"\nPlotting failed test idx={idx}, true={y_test[idx]}")
+            plot_trial_debug(sims_for_test[idx], clf, true_label=y_test[idx], n_bins=n_bins, sim_duration_s=0.4)
 
 
 if __name__ == "__main__":
