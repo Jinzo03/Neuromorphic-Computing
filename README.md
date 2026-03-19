@@ -223,10 +223,7 @@ Possible next steps include:
 
 ## License
 
-- MIT
-- Apache 2.0
-- no license if the repository is private
-
+This project is open-source and available under the MIT License.
 ---
 
 ## Acknowledgements
