@@ -130,18 +130,11 @@ pip install numpy matplotlib pandas scikit-learn brian2 jupyter
 
 ## How to run
 
-### Option 1: run the notebook
+### Run the notebook
 Open the notebook and run all cells in order:
 
 ```bash
 jupyter notebook neuromorphic_snn_v6.ipynb
-```
-
-### Option 2: run the Python script
-If you prefer the script version:
-
-```bash
-python step3_snn_pipeline_tuned.py
 ```
 
 The script/notebook will:
@@ -151,7 +144,7 @@ The script/notebook will:
 - train the readout,
 - evaluate accuracy,
 - compute latency,
-- save plots and a CSV summary into `results/`.
+- save plots and a CSV summary into `results_v6/`.
 
 ---
 
